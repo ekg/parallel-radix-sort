@@ -53,9 +53,7 @@ main(int argc, char *argv[]) {
     parallel_radix_sort::temp_file::set_dir("work");
     parallel_radix_sort::utility::buffer_t buf;
     parallel_radix_sort::utility::OpenDiskBackedBuffer(std::string(argv[optind]), &buf);
-    parallel_radix_sort::KeySort<uint8_t> key_sort;
-    key_sort.Init(buf.size/sizeof(uint8_t));
-    key_sort.Sort((uint8_t*)buf.data, buf.size/sizeof(uint8_t));
+    parallel_radix_sort::SortKeys((uint8_t*)buf.data, buf.size/sizeof(uint8_t));
     parallel_radix_sort::utility::CloseDiskBackedBuffer(&buf);
     optind++;
   }

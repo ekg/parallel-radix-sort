@@ -40,8 +40,135 @@
 #include <climits>
 #include <algorithm>
 #include <utility>
+#include <string>
+#include <iostream>
+#include <fstream>
+
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+#include <omp.h>
+
+#include <set>
+#include <signal.h>
+#include <mutex>
+#include <sys/types.h>
+#include <dirent.h>
+#include <cstdint>
 
 namespace parallel_radix_sort {
+
+namespace temp_file {
+
+// We use this to make the API thread-safe
+std::recursive_mutex monitor;
+
+std::string temp_dir;
+
+std::string get_dir(void);
+
+/// Because the names are in a static object, we can delete them when
+/// std::exit() is called.
+struct Handler {
+    std::set<std::string> filenames;
+    std::string parent_directory;
+    ~Handler() {
+        // No need to lock in static destructor
+        for (auto& filename : filenames) {
+            std::remove(filename.c_str());
+        }
+        if (!parent_directory.empty()) {
+            // There may be extraneous files in the directory still (like .fai files)
+            auto directory = opendir(parent_directory.c_str());
+            
+            dirent* dp;
+            while ((dp = readdir(directory)) != nullptr) {
+                // For every item still in it, delete it.
+                // TODO: Maybe eventually recursively delete?
+                std::remove((parent_directory + "/" + dp->d_name).c_str());
+            }
+            closedir(directory);
+            
+            // Delete the directory itself
+            std::remove(parent_directory.c_str());
+        }
+    }
+} handler;
+
+std::string create(const std::string& base) {
+    std::lock_guard<std::recursive_mutex> lock(monitor);
+
+    if (handler.parent_directory.empty()) {
+        // Make a parent directory for our temp files
+        std::string tmpdirname = get_dir() + "/parallel-radix-sort-XXXXXX";
+        auto got = mkdtemp(&tmpdirname[0]);
+        if (got != nullptr) {
+            // Save the directory we got
+            handler.parent_directory = got;
+        } else {
+            std::cerr << "[parallel_radix_sort.hpp]: couldn't create temp directory: " << tmpdirname << std::endl;
+            exit(1);
+        }
+    }
+
+    std::string tmpname = handler.parent_directory + "/" + base + "XXXXXX";
+    // hack to use mkstemp to get us a safe temporary file name
+    int fd = mkstemp(&tmpname[0]);
+    if(fd != -1) {
+        // we don't leave it open; we are assumed to open it again externally
+        close(fd);
+    } else {
+        std::cerr << "[parallel_radix_sort.hpp]: couldn't create temp file on base "
+                  << base << " : " << tmpname << std::endl;
+        exit(1);
+    }
+    handler.filenames.insert(tmpname);
+    return tmpname;
+}
+
+std::string create() {
+    // No need to lock as we call this thing that locks
+    return create("parallel-radix-sort-");
+}
+
+void remove(const std::string& filename) {
+    std::lock_guard<std::recursive_mutex> lock(monitor);
+    
+    std::remove(filename.c_str());
+    handler.filenames.erase(filename);
+}
+
+void set_dir(const std::string& new_temp_dir) {
+    std::lock_guard<std::recursive_mutex> lock(monitor);
+    
+    temp_dir = new_temp_dir;
+}
+
+std::string get_dir() {
+    std::lock_guard<std::recursive_mutex> lock(monitor);
+
+    // Get the default temp dir from environment variables.
+    if (temp_dir.empty()) {
+        const char* system_temp_dir = nullptr;
+        for(const char* var_name : {"TMPDIR", "TMP", "TEMP", "TEMPDIR", "USERPROFILE"}) {
+            if (system_temp_dir == nullptr) {
+                system_temp_dir = getenv(var_name);
+            }
+        }
+        temp_dir = (system_temp_dir == nullptr ? "/tmp" : system_temp_dir);
+    }
+
+    return temp_dir;
+}
+
+} // namespace temp_file
+
 namespace utility {
 // Return the number of threads that would be executed in parallel regions
 int GetMaxThreads() {
@@ -71,6 +198,82 @@ int GetThreadId() {
   return 0;
 #endif
 }
+
+struct buffer_t {
+  int fd;
+  size_t size;
+  std::string path;
+  void *data;
+};
+
+int OpenDiskBackedBuffer(const std::string& path, buffer_t* buf) {
+  void* buffer = NULL;
+  int fd = open(path.c_str(), O_RDWR);
+  if (fd == -1) {
+      goto error;
+  }
+
+  struct stat stats;
+  if (-1 == fstat(fd, &stats)) {
+      goto error;
+  }
+
+  if (!(buffer = mmap(NULL,
+                      stats.st_size,
+                      PROT_READ | PROT_WRITE,
+                      MAP_SHARED,
+                      fd,
+                      0))) {
+      goto error;
+  }
+
+  madvise(buffer, stats.st_size, POSIX_MADV_WILLNEED | POSIX_MADV_SEQUENTIAL);
+
+  buf->data = buffer;
+  buf->size = stats.st_size;
+  buf->path = path;
+  buf->fd = fd;
+  return 0;
+
+error:
+  std::cerr << "error opening " << path << std::endl;
+  if (buffer)
+      munmap(buffer, stats.st_size);
+  if (fd != -1)
+      close(fd);
+  buf->data = 0;
+  buf->fd = 0;
+  return -1;
+}
+
+void CloseDiskBackedBuffer(buffer_t* buf) {
+  if (buf->data) {
+      munmap(buf->data, buf->size);
+      buf->data = 0;
+      buf->size = 0;
+  }
+  if (buf->fd) {
+    close(buf->fd);
+    buf->fd = 0;
+  }
+}
+
+int CreateDiskBackedBuffer(buffer_t* buf, size_t size) {
+    std::string tmp_path = temp_file::create();
+    // make an empty file with size bytes
+    std::ofstream ofs(tmp_path, std::ios::binary | std::ios::out);
+    std::cerr << "creating file buffer " << tmp_path << " of " << size << " bytes" << std::endl;
+    ofs.seekp(size - 1);
+    ofs.write("", 1);
+    ofs.close();
+    return OpenDiskBackedBuffer(tmp_path, buf);
+}
+
+int RemoveDiskBackedBuffer(buffer_t* buf) {
+    CloseDiskBackedBuffer(buf);
+    std::remove(buf->path.c_str());
+}
+
 }  // namespace utility
 
 namespace internal {
@@ -97,6 +300,7 @@ private:
   int max_threads_;
 
   UnsignedType *tmp_;
+  utility::buffer_t tmp_buf_;
   size_t **histo_;
   UnsignedType ***out_buf_;
   size_t **out_buf_n_;
@@ -144,7 +348,8 @@ template<typename PlainType, typename UnsignedType, typename Encoder,
 void ParallelRadixSortInternal
 <PlainType, UnsignedType, Encoder, ValueManager, Base>
 ::DeleteAll() {
-  delete [] tmp_;
+
+  utility::RemoveDiskBackedBuffer(&tmp_buf_);
   tmp_ = NULL;
 
   for (int i = 0; i < max_threads_; ++i) delete [] histo_[i];
@@ -186,7 +391,8 @@ void ParallelRadixSortInternal
   assert(max_threads >= 1);
   max_threads_ = max_threads;
 
-  tmp_ = new UnsignedType[max_elems];
+  utility::CreateDiskBackedBuffer(&tmp_buf_, max_elems*sizeof(UnsignedType*));
+  tmp_ = (UnsignedType*) tmp_buf_.data;
   histo_ = new size_t*[max_threads];
   for (int i = 0; i < max_threads; ++i) {
     histo_[i] = new size_t[1 << Base];
@@ -227,6 +433,7 @@ void ParallelRadixSortInternal
   prs.Init(num_elems, num_threads);
   const PlainType *res = prs.Sort(data, num_elems, num_threads, value_manager);
   if (res != data) {
+#pragma omp parallel for schedule(static,1000000)
     for (size_t i = 0; i < num_elems; ++i) data[i] = res[i];
   }
 }
@@ -452,6 +659,7 @@ private:
 
   static const size_t kOutBufferSize = internal::kOutBufferSize;
   ValueType *original_, *tmp_;
+  utility::buffer_t tmp_buf_;
   ValueType *src_, *dst_;
   ValueType ***out_buf_;
 
@@ -471,7 +679,8 @@ void PairValueManager<ValueType, Base>
   max_elems_ = max_elems;
   max_threads_ = max_threads;
 
-  tmp_ = new ValueType[max_elems];
+  utility::CreateDiskBackedBuffer(&tmp_buf_, max_elems*sizeof(ValueType*));
+  tmp_ = (ValueType*) tmp_buf_.data;
 
   out_buf_ = new ValueType**[max_threads];
   for (int i = 0; i < max_threads; ++i) {
@@ -485,7 +694,8 @@ void PairValueManager<ValueType, Base>
 template<typename ValueType, int Base>
 void PairValueManager<ValueType, Base>
 ::DeleteAll() {
-  delete [] tmp_;
+
+  utility::RemoveDiskBackedBuffer(&tmp_buf_);
   tmp_ = NULL;
 
   for (int i = 0; i < max_threads_; ++i) {

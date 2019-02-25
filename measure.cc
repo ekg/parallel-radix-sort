@@ -1,4 +1,4 @@
-#include "parallel_radix_sort.h"
+#include "parallel_radix_sort.hpp"
 
 #include <cstdio>
 #include <unistd.h>
@@ -50,12 +50,17 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
-  int N = DEFAULT_N;
-  if (argc == 2) N = 1 << atoi(argv[1]);
-  printf("N = %d\n", N);
+  uint64_t N = DEFAULT_N;
+  if (argc == 2) N = (uint64_t)1 << std::stoul(argv[1]);
+  std::cout << "N = " << N << std::endl;
 
   int *buf;
-  buf = new int[N];
+  //buf = new int[N];
+  //std::string path = "input.dat";
+  parallel_radix_sort::temp_file::set_dir("work");
+  parallel_radix_sort::utility::buffer_t x;
+  parallel_radix_sort::utility::CreateDiskBackedBuffer(&x, N*sizeof(int));
+  buf = (int*) x.data;
   assert(buf);
 
   parallel_radix_sort::KeySort<int> key_sort;
@@ -68,12 +73,16 @@ int main(int argc, char **argv) {
     }
   }
 
+  parallel_radix_sort::utility::RemoveDiskBackedBuffer(&x);
+  buf = NULL;
+  /*
   for (int t = 0; t < TRIAL; ++t) {
     InitRandom(buf, N);
     benchmark("std::sort(%d)", t) {
       std::sort(buf, buf + N);
     }
   }
+  */
 
   exit(EXIT_SUCCESS);
 }
